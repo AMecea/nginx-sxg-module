@@ -30,7 +30,7 @@ find_package (OpenSSL REQUIRED)
 find_library (LIBSXG NAMES sxg)
 
 add_library (ngx_sxg_utils SHARED ngx_sxg_utils.c)
-include_directories(/home/twifkak/usr/include)
+include_directories($(PROJECT_SOURCE_DIR)/libs/include)
 target_link_libraries (ngx_sxg_utils PRIVATE ${LIBSXG} ${OPENSSL_LIBRARIES})
 
 # This target requires cmake-format executable in your path.
@@ -47,7 +47,7 @@ include (ExternalProject)
 ExternalProject_Add (
   googletest
   GIT_REPOSITORY https://github.com/google/googletest
-  GIT_TAG master
+  GIT_TAG release-1.12.1
   SOURCE_DIR ${PROJECT_BINARY_DIR}/third_party/gtest
   BINARY_DIR ${PROJECT_BINARY_DIR}/gtest
   INSTALL_COMMAND "")

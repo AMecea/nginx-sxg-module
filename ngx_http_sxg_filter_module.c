@@ -29,6 +29,8 @@
 #include "openssl/pem.h"
 #endif
 
+#define HEADERS_LIST_INIT_SIZE 2
+
 typedef struct {
   ngx_flag_t enable;
   size_t sxg_max_payload;
@@ -39,6 +41,7 @@ typedef struct {
   ngx_str_t cert_path;
   time_t expiry_seconds;
   ngx_str_t fallback_host;
+  ngx_array_t *keep_headers;
   sxg_signer_list_t signers;
 
   // Protected by cert_chain_lock;
@@ -111,6 +114,9 @@ static ngx_command_t ngx_http_sxg_commands[] = {
     {ngx_string("sxg_fallback_host"), NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1,
      ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_sxg_loc_conf_t, fallback_host), NULL},
+    {ngx_string("sxg_keep_header"), NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_str_array_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_sxg_loc_conf_t, keep_headers), NULL},
     ngx_null_command};
 
 static ngx_http_module_t ngx_http_sxg_filter_module_ctx = {
@@ -174,6 +180,8 @@ static void* ngx_http_sxg_create_loc_conf(ngx_conf_t* cf) {
   slc->fallback_host = (ngx_str_t){.data = NULL, .len = 0};
   slc->signers = sxg_empty_signer_list();
   slc->cert_chain = ngx_sxg_empty_cert_chain();
+  slc->keep_headers = NGX_CONF_UNSET_PTR;
+
   if (pthread_mutex_init(&slc->cert_chain_lock, NULL) != 0) {
     ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
                   "nginx-sxg-module: failed to initialize cert_chain_lock");
@@ -196,6 +204,7 @@ static char* ngx_http_sxg_merge_loc_conf(ngx_conf_t* cf, void* parent,
   ngx_conf_merge_sec_value(conf->expiry_seconds, prev->expiry_seconds,
                            60 * 60 * 24);  // 1 day.
   ngx_conf_merge_str_value(conf->fallback_host, prev->fallback_host, "");
+  ngx_conf_merge_ptr_value(conf->keep_headers, prev->keep_headers, NGX_CONF_UNSET_PTR);
 
   if (!is_valid_config(cf, conf)) {
     if (conf->enable) {
@@ -816,6 +825,56 @@ static bool copy_buffer_to_sxg_buffer(const ngx_http_request_t* req,
   return true;
 }
 
+ngx_list_t * save_keep_headers(ngx_http_request_t* req,
+                       ngx_http_sxg_loc_conf_t* slc,
+                       ngx_list_t *headers_out) {
+
+  if (slc->keep_headers == NGX_CONF_UNSET_PTR) {
+    return NULL;
+  }
+
+  ngx_list_t *saved_headers = ngx_list_create(req->pool, HEADERS_LIST_INIT_SIZE, sizeof(ngx_table_elt_t));
+
+  ngx_str_t *keep_headers = slc->keep_headers->elts;
+
+  //iterate over headers array from config.
+  for(size_t j = 0; j < slc->keep_headers->nelts; j++) {
+
+    for (const ngx_list_part_t* out_part = &headers_out->part;
+        out_part != NULL; out_part = out_part->next) {
+
+      ngx_table_elt_t* out_headers = out_part->elts;
+      for (size_t i = 0; i < out_part->nelts; i++) {
+        if (out_headers[i].key.len == keep_headers[j].len &&
+            ngx_strncasecmp(keep_headers[j].data,
+                            out_headers[i].key.data,
+                            out_headers[i].key.len) == 0) {
+
+          ngx_table_elt_t *h = ngx_list_push(saved_headers);
+          if (h == NULL) {
+            ngx_log_error(NGX_LOG_ERR, req->connection->log, 0,
+                  "nginx-sxg-module: failed to save headers");
+            return NULL;
+          }
+          h->key.data = ngx_palloc(req->pool, out_headers[i].key.len);
+          h->value.data = ngx_palloc(req->pool, out_headers[i].value.len);
+          h->key.len = out_headers[i].key.len;
+          h->value.len = out_headers[i].value.len;
+          h->hash = 1;
+          ngx_memcpy(h->key.data, out_headers[i].key.data, out_headers[i].key.len);
+          ngx_memcpy(h->value.data, out_headers[i].value.data, out_headers[i].value.len);
+        }
+      }
+    }
+  }
+
+  if (saved_headers->part.nelts > 0) {
+    return saved_headers;
+  }
+
+  return NULL;
+}
+
 static bool make_chain_from_buffer(ngx_http_request_t* req,
                                    const sxg_buffer_t* src, ngx_chain_t** dst) {
   ngx_buf_t* b = ngx_calloc_buf(req->pool);
@@ -895,6 +954,10 @@ static ngx_int_t ngx_http_sxg_body_filter_impl(ngx_http_request_t* req,
     return NGX_AGAIN;
   }
 
+  // Save headers that will be kept for the outer request.
+  ngx_list_t *saved_headers =
+    save_keep_headers(req, slc, &req->headers_out.headers);
+
   // Copy SXG headers to innerHTML header.
   if (!sxg_header_append_string("content-type",
                                 (const char*)req->headers_out.content_type.data,
@@ -909,7 +972,7 @@ static ngx_int_t ngx_http_sxg_body_filter_impl(ngx_http_request_t* req,
 
   // Cleanup outer headers and trailers.
   ngx_memzero(&req->headers_out, sizeof(ngx_http_headers_out_t));
-  if (ngx_list_init(&req->headers_out.headers, req->pool, 2,
+  if (ngx_list_init(&req->headers_out.headers, req->pool, HEADERS_LIST_INIT_SIZE,
                     sizeof(ngx_table_elt_t)) != NGX_OK) {
     ngx_log_error(NGX_LOG_ERR, req->connection->log, 0,
                   "nginx-sxg-module: failed to initialize outer header list");
@@ -932,6 +995,12 @@ static ngx_int_t ngx_http_sxg_body_filter_impl(ngx_http_request_t* req,
   vary->hash = 1;
   ngx_str_set(&vary->key, "Vary");
   ngx_str_set(&vary->value, "Accept");
+
+  // Concatenate saved_headers list to headers_out.headers list
+  if (saved_headers != NULL) {
+    req->headers_out.headers.last->next = &saved_headers->part;
+    req->headers_out.headers.last = saved_headers->last;
+  }
 
   // Modify out of list outer header entries.
   ngx_str_set(&req->headers_out.content_type,
