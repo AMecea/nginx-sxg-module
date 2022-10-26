@@ -96,6 +96,13 @@ The hostname of fallback url of generated SXG file.
 This directive is optional.
 The default value is Host field parameter of HTTP request header.
 
+#### sxg\_keep\_header
+
+Specify header to keep on the outer response. 
+This directive can be specified multiple times.
+This directive is optional.
+
+
 ### Config Example
 
 ```
