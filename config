@@ -23,7 +23,10 @@ if test -n "$ngx_module_link"; then
   ngx_module_name="ngx_http_sxg_filter_module"
   ngx_module_srcs="$SRCS"
   ngx_module_deps="$DEPS"
-  ngx_module_libs="$CORE_LIBS -lssl -lcrypto -lsxg -L/usr/local/lib"
+  #ngx_module_libs="$CORE_LIBS -lssl -lcrypto -lsxg -L/usr/local/lib"
+  # $CORE_LIBS is polluted with -Wl,--require-define=pcre_version and it dosen't work on bullseye.
+  ngx_module_libs="-lssl -lcrypto -lsxg -L/usr/local/lib"
+
   . auto/module
 else
   HTTP_AUX_FILTER_MODULES="$HTTP_AUX_FILTER_MODULES $ngx_addon_name"
